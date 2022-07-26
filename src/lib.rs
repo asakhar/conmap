@@ -23,15 +23,14 @@ pub struct OccupiedEntry<'map, K, V> {
 }
 
 impl<'map, K, V> OccupiedEntry<'map, K, V> {
+  fn get(&self) -> &ContainerItem<K, V> {
+    unsafe { self.data.get_unchecked(self.idx) }
+  }
   fn get_value(&self) -> &V {
-    unsafe { &*self.data.get_unchecked(self.idx).1.get() }
-      .as_ref()
-      .unwrap()
+    unsafe { &*self.get().1.get() }.as_ref().unwrap()
   }
   fn get_key(&self) -> &K {
-    unsafe { &*self.data.get_unchecked(self.idx).0.get() }
-      .as_ref()
-      .unwrap()
+    unsafe { &*self.get().0.get() }.as_ref().unwrap()
   }
 }
 
@@ -108,6 +107,34 @@ impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
       Err(r) => r,
     };
     self.value_unchecked()
+  }
+  pub fn remove(mut self) -> bool {
+    match &mut self {
+      Entry::Vacant(entry) => {
+        let entry = entry.map.entry(entry.key.take().unwrap());
+        if entry.as_occupied().is_none() {
+          return false;
+        }
+        entry.remove()
+      }
+      Entry::Occupied(entry) => {
+        let cell = entry.get();
+        while cell
+          .2
+          .compare_exchange_weak(
+            UNINITIALIZED + 1,
+            UNINITIALIZED,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+          )
+          .is_err()
+        {}
+        unsafe { &mut *cell.0.get() }.take();
+        unsafe { &mut *cell.1.get() }.take();
+        cell.2.store(REMOVED, Ordering::SeqCst);
+        true
+      }
+    }
   }
 }
 
