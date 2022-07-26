@@ -383,4 +383,33 @@ mod tests {
     map.insert("abcde", 1).unwrap();
     assert_eq!(*map.entry("abc").or_insert(2), 1);
   }
+
+  #[test]
+  fn drop_check() {
+    static ALIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug)]
+    struct CountsDrops {}
+    impl CountsDrops {
+      fn new() -> Self {
+        ALIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        Self {}
+      }
+    }
+    impl Drop for CountsDrops {
+      fn drop(&mut self) {
+        ALIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+      }
+    }
+    {
+      let map = ConMap::with_capacity(1);
+      for (i, c) in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        .chars()
+        .enumerate()
+      {
+        map.insert(c, CountsDrops::new()).unwrap().value().unwrap();
+        assert_eq!(ALIVE_COUNT.load(Ordering::Relaxed), i + 1);
+      }
+    }
+    assert_eq!(ALIVE_COUNT.load(Ordering::Relaxed), 0);
+  }
 }
