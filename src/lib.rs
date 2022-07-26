@@ -9,9 +9,24 @@ use std::{
   },
 };
 
-const EMPTY: usize = 0;
-const REMOVED: usize = 1;
-const UNINITIALIZED: usize = 2;
+const HASH_STEP: usize = 1337;
+
+#[allow(non_snake_case)]
+mod CellState {
+  #[allow(non_upper_case_globals)]
+  pub const Empty: usize = 0;
+  #[allow(non_upper_case_globals)]
+  pub const Removed: usize = 1;
+  #[allow(non_upper_case_globals)]
+  pub const Uninit: usize = 2;
+
+  #[macro_export(local_inner_macros)]
+  macro_rules! Valid {
+    ($n:expr) => {
+      (CellState::Uninit + 1 + $n)
+    };
+  }
+}
 
 type ContainerItem<K, V> = (UnsafeCell<Option<K>>, UnsafeCell<Option<V>>, AtomicUsize);
 type Container<K, V> = Vec<ContainerItem<K, V>>;
@@ -122,8 +137,8 @@ impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
         while cell
           .2
           .compare_exchange_weak(
-            UNINITIALIZED + 1,
-            UNINITIALIZED,
+            Valid!(1),
+            CellState::Uninit,
             Ordering::SeqCst,
             Ordering::Relaxed,
           )
@@ -131,7 +146,7 @@ impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
         {}
         unsafe { &mut *cell.0.get() }.take();
         unsafe { &mut *cell.1.get() }.take();
-        cell.2.store(REMOVED, Ordering::SeqCst);
+        cell.2.store(CellState::Removed, Ordering::SeqCst);
         true
       }
     }
@@ -148,19 +163,31 @@ pub struct ConMap<K, V> {
 impl<K: Hash + PartialEq, V> ConMap<K, V> {
   fn realloc(&self) {
     let mut data = self.data.write().unwrap();
-    let new_cap = data.capacity() << 4;
+    let mut new_cap = data.capacity() << 4;
+    if new_cap == 0 {
+      new_cap = 50;
+    }
     let old_data = data
-      .iter()
-      .filter(|(_, _, state)| state.load(Ordering::Relaxed) > UNINITIALIZED)
-      .map(|(key, value, _)| unsafe { ((*key.get()).take(), (*value.get()).take()) })
+      .iter_mut()
+      .map(|(key, value, state)| {
+        let state_load = state.load(Ordering::Relaxed);
+        if state_load <= CellState::Uninit {
+          key.get_mut().take();
+          value.get_mut().take();
+        }
+        state.store(CellState::Empty, Ordering::Relaxed);
+        (key, value, state_load > CellState::Uninit)
+      })
+      .filter(|(_, _, should_take)| *should_take)
+      .map(|(key, value, _)| {
+        (
+          key.get_mut().take().unwrap(),
+          value.get_mut().take().unwrap(),
+        )
+      })
       .collect::<Vec<_>>();
     let old_len = data.len();
     data.reserve(new_cap - old_len);
-    for item in data.iter_mut() {
-      item.0.get_mut().take();
-      item.1.get_mut().take();
-      item.2.store(EMPTY, Ordering::Relaxed);
-    }
     let new_cap = data.capacity();
     let remaining = new_cap - old_len;
     for _ in 0..remaining {
@@ -171,7 +198,13 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
       ));
     }
     for (key, value) in old_data {
-      self.insert_unchecked_no_ret(&data, key.unwrap(), value.unwrap());
+      self.insert_unchecked_no_ret(&data, key, value);
+    }
+  }
+
+  pub fn new() -> Self {
+    Self {
+      data: RwLock::new(Vec::new()),
     }
   }
 
@@ -188,13 +221,13 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
       data: RwLock::new(data),
     }
   }
+
   pub fn insert<'map>(&'map self, mut key: K, mut value: V) -> InsertionResult<Entry<'map, K, V>> {
     loop {
       match self.insert_unchecked(key, value) {
         Ok(ins_res) => return ins_res,
-        Err((k, v)) => {
-          key = k;
-          value = v
+        Err(kv) => {
+          (key, value) = kv;
         }
       }
       self.realloc();
@@ -214,13 +247,13 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
 
       loop {
         let current_state = cell.2.load(Ordering::SeqCst);
-        if current_state == EMPTY {
+        if current_state == CellState::Empty {
           break 'outer;
         }
-        if current_state == REMOVED {
+        if current_state == CellState::Removed {
           break;
         }
-        if current_state == usize::MAX || current_state == UNINITIALIZED {
+        if current_state == usize::MAX || current_state == CellState::Uninit {
           continue;
         }
         if cell
@@ -242,7 +275,7 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
         }
         return Entry::Occupied(OccupiedEntry { idx: hash, data });
       }
-      hash = (hash + 1337) % cap;
+      hash = (hash + HASH_STEP) % cap;
     }
     return Entry::Vacant(VacantEntry {
       key: Some(key),
@@ -266,9 +299,12 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     key: K,
     value: V,
   ) -> Result<InsertionResult<usize>, (K, V)> {
+    let cap = data.capacity();
+    if cap == 0 {
+      return Err((key, value));
+    }
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
-    let cap = data.capacity();
     let mut hash = hasher.finish() as usize % cap;
 
     for _ in 0..cap {
@@ -277,22 +313,27 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
       loop {
         let state = cell.2.load(Ordering::SeqCst);
 
-        if state < UNINITIALIZED {
+        if state < CellState::Uninit {
           if cell
             .2
-            .compare_exchange(state, UNINITIALIZED, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange(
+              state,
+              CellState::Uninit,
+              Ordering::SeqCst,
+              Ordering::Relaxed,
+            )
             .is_ok()
           {
             unsafe { *cell.0.get() = Some(key) };
             unsafe { *cell.1.get() = Some(value) };
 
-            cell.2.store(UNINITIALIZED + 2, Ordering::SeqCst);
+            cell.2.store(Valid!(1), Ordering::SeqCst);
             return Ok(Ok(hash));
           }
           continue;
         }
 
-        if state == usize::MAX || state == UNINITIALIZED {
+        if state == usize::MAX || state == CellState::Uninit {
           continue;
         }
         if cell
@@ -309,7 +350,7 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
         }
         return Ok(Err(hash));
       }
-      hash = (hash + 1337) % cap;
+      hash = (hash + HASH_STEP) % cap;
     }
     return Err((key, value));
   }
@@ -359,10 +400,10 @@ impl<'map, K: Hash + PartialEq<K>, V> Iterator for Iter<'map, K, V> {
       let cell = unsafe { self.data.get_unchecked(i) };
       loop {
         let current_state = cell.2.load(Ordering::SeqCst);
-        if current_state <= REMOVED {
+        if current_state <= CellState::Removed {
           continue 'outer;
         }
-        if current_state == usize::MAX || current_state == UNINITIALIZED {
+        if current_state == usize::MAX || current_state == CellState::Uninit {
           continue;
         }
         if cell
@@ -377,7 +418,7 @@ impl<'map, K: Hash + PartialEq<K>, V> Iterator for Iter<'map, K, V> {
         {
           continue;
         }
-        assert!(cell.2.load(Ordering::SeqCst) > UNINITIALIZED);
+        debug_assert!(cell.2.load(Ordering::SeqCst) > Valid!(0));
         self.idx = i + 1;
         return Some(Entry::Occupied(OccupiedEntry {
           idx: i,
@@ -438,5 +479,26 @@ mod tests {
       }
     }
     assert_eq!(ALIVE_COUNT.load(Ordering::Relaxed), 0);
+  }
+
+  #[test]
+  fn remove_items() {
+    let map = ConMap::with_capacity(10);
+    map.insert("a", "a").unwrap();
+    let b = map.insert("b", "b").unwrap();
+    map.insert("c", "c").unwrap();
+    assert!(b.remove());
+    assert_eq!(map.entry("a").value(), Some(&"a"));
+    assert_eq!(map.entry("c").value(), Some(&"c"));
+    assert_eq!(map.entry("b").value(), None);
+  }
+
+  #[test]
+  fn lazy_init() {
+    let map = ConMap::new();
+    map.insert("abc", 1).unwrap();
+    map.insert("abcd", 1).unwrap();
+    map.insert("abcde", 1).unwrap();
+    assert_eq!(*map.entry("abc").or_insert(2), 1);
   }
 }
