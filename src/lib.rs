@@ -3,10 +3,8 @@ use std::{
   collections::hash_map::DefaultHasher,
   fmt::Debug,
   hash::{Hash, Hasher},
-  marker::PhantomData,
-  ptr,
   sync::{
-    atomic::{AtomicPtr, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     RwLock, RwLockReadGuard,
   },
 };
@@ -15,18 +13,25 @@ const EMPTY: usize = 0;
 const REMOVED: usize = 1;
 const UNINITIALIZED: usize = 2;
 
+type ContainerItem<K, V> = (UnsafeCell<Option<K>>, UnsafeCell<Option<V>>, AtomicUsize);
+type Container<K, V> = Vec<ContainerItem<K, V>>;
+
 #[derive(Debug)]
 pub struct OccupiedEntry<'map, K, V> {
   idx: usize,
-  data: RwLockReadGuard<'map, Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>>,
+  data: RwLockReadGuard<'map, Container<K, V>>,
 }
 
 impl<'map, K, V> OccupiedEntry<'map, K, V> {
   fn get_value(&self) -> &V {
-    unsafe { &*self.data.get_unchecked(self.idx).1.load(Ordering::SeqCst) }
+    unsafe { &*self.data.get_unchecked(self.idx).1.get() }
+      .as_ref()
+      .unwrap()
   }
   fn get_key(&self) -> &K {
-    unsafe { &*self.data.get_unchecked(self.idx).0.load(Ordering::SeqCst) }
+    unsafe { &*self.data.get_unchecked(self.idx).0.get() }
+      .as_ref()
+      .unwrap()
   }
 }
 
@@ -110,31 +115,36 @@ pub type InsertionResult<T> = Result<T, T>;
 
 #[derive(Debug)]
 pub struct ConMap<K, V> {
-  data: RwLock<Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>>,
-  _phantom: PhantomData<UnsafeCell<(K, V)>>,
+  data: RwLock<Container<K, V>>,
 }
 
 impl<K: Hash + PartialEq, V> ConMap<K, V> {
   fn realloc(&self) {
     let mut data = self.data.write().unwrap();
-    let new_cap = data.capacity() << 2;
+    let new_cap = data.capacity() << 4;
     let old_data = data
       .iter()
       .filter(|(_, _, state)| state.load(Ordering::Relaxed) > UNINITIALIZED)
-      .map(|(key, value, _)| (key.load(Ordering::Relaxed), value.load(Ordering::Relaxed)))
+      .map(|(key, value, _)| unsafe { ((*key.get()).take(), (*value.get()).take()) })
       .collect::<Vec<_>>();
-    data.clear();
-    data.reserve(new_cap);
+    let old_len = data.len();
+    data.reserve(new_cap - old_len);
+    for item in data.iter_mut() {
+      item.0.get_mut().take();
+      item.1.get_mut().take();
+      item.2.store(EMPTY, Ordering::Relaxed);
+    }
     let new_cap = data.capacity();
-    for _ in 0..new_cap {
+    let remaining = new_cap - old_len;
+    for _ in 0..remaining {
       data.push((
-        AtomicPtr::new(ptr::null_mut()),
-        AtomicPtr::new(ptr::null_mut()),
+        UnsafeCell::new(None),
+        UnsafeCell::new(None),
         AtomicUsize::new(0),
       ));
     }
     for (key, value) in old_data {
-      self.insert_unchecked_no_ret(&data, key, value); //("Failed to insert value to reallocated array");
+      self.insert_unchecked_no_ret(&data, key.unwrap(), value.unwrap());
     }
   }
 
@@ -142,23 +152,23 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     let mut data = Vec::with_capacity(cap);
     for _ in 0..cap {
       data.push((
-        AtomicPtr::new(ptr::null_mut()),
-        AtomicPtr::new(ptr::null_mut()),
+        UnsafeCell::new(None),
+        UnsafeCell::new(None),
         AtomicUsize::new(0),
       ));
     }
     Self {
       data: RwLock::new(data),
-      _phantom: Default::default(),
     }
   }
-  pub fn insert<'map>(&'map self, key: K, value: V) -> InsertionResult<Entry<'map, K, V>> {
-    let key_raw_ptr = Box::into_raw(Box::new(key));
-    let value_raw_ptr = Box::into_raw(Box::new(value));
-
+  pub fn insert<'map>(&'map self, mut key: K, mut value: V) -> InsertionResult<Entry<'map, K, V>> {
     loop {
-      if let Some(ins_res) = self.insert_unchecked(key_raw_ptr, value_raw_ptr) {
-        return ins_res;
+      match self.insert_unchecked(key, value) {
+        Ok(ins_res) => return ins_res,
+        Err((k, v)) => {
+          key = k;
+          value = v
+        }
       }
       self.realloc();
     }
@@ -198,8 +208,7 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
         {
           continue;
         }
-        let key_raw_ptr = cell.0.load(Ordering::SeqCst);
-        let key_ref = unsafe { &*key_raw_ptr };
+        let key_ref = unsafe { &*cell.0.get() }.as_ref().unwrap();
         if key_ref != &key {
           cell.2.fetch_sub(1, Ordering::SeqCst);
           break;
@@ -214,14 +223,9 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     });
   }
 
-  fn insert_unchecked_no_ret<'map>(
-    &'map self,
-    data: &Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>,
-    key: *mut K,
-    value: *mut V,
-  ) {
+  fn insert_unchecked_no_ret(&self, data: &Container<K, V>, key: K, value: V) {
     let release = |idx| {
-      let cell: &(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize) = unsafe { data.get_unchecked(idx) };
+      let cell: &ContainerItem<K, V> = unsafe { data.get_unchecked(idx) };
       cell.2.fetch_sub(1, Ordering::Relaxed);
     };
     let _ = self
@@ -229,15 +233,14 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
       .map(|res| res.map(release).map_err(release));
   }
 
-  fn insert_unchecked_internal<'map>(
-    &'map self,
-    data: &Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>,
-    key: *mut K,
-    value: *mut V,
-  ) -> Option<InsertionResult<usize>> {
+  fn insert_unchecked_internal(
+    &self,
+    data: &Container<K, V>,
+    key: K,
+    value: V,
+  ) -> Result<InsertionResult<usize>, (K, V)> {
     let mut hasher = DefaultHasher::new();
-    let key_ref = unsafe { &*key };
-    key_ref.hash(&mut hasher);
+    key.hash(&mut hasher);
     let cap = data.capacity();
     let mut hash = hasher.finish() as usize % cap;
 
@@ -253,14 +256,11 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
             .compare_exchange(state, UNINITIALIZED, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
           {
-            cell
-              .0
-              .compare_exchange(ptr::null_mut(), key, Ordering::SeqCst, Ordering::Relaxed)
-              .unwrap();
+            unsafe { *cell.0.get() = Some(key) };
+            unsafe { *cell.1.get() = Some(value) };
 
-            cell.1.store(value, Ordering::SeqCst);
             cell.2.store(UNINITIALIZED + 2, Ordering::SeqCst);
-            return Some(Ok(hash));
+            return Ok(Ok(hash));
           }
           continue;
         }
@@ -275,23 +275,23 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
         {
           continue;
         }
-        let cell_key = unsafe { &*cell.0.load(Ordering::SeqCst) };
-        if cell_key != key_ref {
+        let cell_key = unsafe { &*cell.0.get() }.as_ref().unwrap();
+        if cell_key != &key {
           cell.2.fetch_sub(1, Ordering::Relaxed);
           break;
         }
-        return Some(Err(hash));
+        return Ok(Err(hash));
       }
       hash = (hash + 1337) % cap;
     }
-    return None;
+    return Err((key, value));
   }
 
   fn insert_unchecked<'map>(
     &'map self,
-    key: *mut K,
-    value: *mut V,
-  ) -> Option<InsertionResult<Entry<'map, K, V>>> {
+    key: K,
+    value: V,
+  ) -> Result<InsertionResult<Entry<'map, K, V>>, (K, V)> {
     let data = self.data.read().unwrap();
     let acquire_access = |idx| {
       Entry::Occupied(OccupiedEntry {
@@ -320,8 +320,8 @@ impl<K, V> ConMap<K, V> {
 
 pub struct Iter<'map, K, V> {
   idx: usize,
-  data: RwLockReadGuard<'map, Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>>,
-  rwlock: &'map RwLock<Vec<(AtomicPtr<K>, AtomicPtr<V>, AtomicUsize)>>,
+  data: RwLockReadGuard<'map, Container<K, V>>,
+  rwlock: &'map RwLock<Container<K, V>>,
 }
 
 impl<'map, K: Hash + PartialEq<K>, V> Iterator for Iter<'map, K, V> {
