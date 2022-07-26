@@ -1,8 +1,9 @@
 use std::{
   cell::UnsafeCell,
-  collections::hash_map::DefaultHasher,
+  collections::hash_map::RandomState,
   fmt::Debug,
-  hash::{Hash, Hasher},
+  hash::{BuildHasher, Hash, Hasher},
+  marker::PhantomData,
   sync::{
     atomic::{AtomicUsize, Ordering},
     RwLock, RwLockReadGuard,
@@ -50,18 +51,18 @@ impl<'map, K, V> OccupiedEntry<'map, K, V> {
 }
 
 #[derive(Debug)]
-pub struct VacantEntry<'map, K, V> {
+pub struct VacantEntry<'map, K, V, S> {
   key: Option<K>,
-  map: &'map ConMap<K, V>,
+  map: &'map ConMap<K, V, S>,
 }
 
 #[derive(Debug)]
-pub enum Entry<'map, K, V> {
-  Vacant(VacantEntry<'map, K, V>),
+pub enum Entry<'map, K, V, S> {
+  Vacant(VacantEntry<'map, K, V, S>),
   Occupied(OccupiedEntry<'map, K, V>),
 }
 
-impl<'map, K, V> Drop for Entry<'map, K, V> {
+impl<'map, K, V, S> Drop for Entry<'map, K, V, S> {
   fn drop(&mut self) {
     if let Entry::Occupied(entry) = self {
       unsafe { entry.data.get_unchecked(entry.idx) }
@@ -70,7 +71,7 @@ impl<'map, K, V> Drop for Entry<'map, K, V> {
     }
   }
 }
-impl<'map, K, V> Entry<'map, K, V> {
+impl<'map, K, V, S> Entry<'map, K, V, S> {
   const fn as_occupied_unchecked(&self) -> &OccupiedEntry<'map, K, V> {
     match self {
       Entry::Vacant(_) => panic!("Called as_occupied on vacant entry"),
@@ -78,7 +79,7 @@ impl<'map, K, V> Entry<'map, K, V> {
     }
   }
   #[allow(dead_code)]
-  const fn as_vacant_unchecked(&self) -> &VacantEntry<'map, K, V> {
+  const fn as_vacant_unchecked(&self) -> &VacantEntry<'map, K, V, S> {
     match self {
       Entry::Occupied(_) => panic!("Called as_vacant on occupied entry"),
       Entry::Vacant(entry) => entry,
@@ -91,7 +92,7 @@ impl<'map, K, V> Entry<'map, K, V> {
     }
   }
   #[allow(dead_code)]
-  const fn as_vacant(&self) -> Option<&VacantEntry<'map, K, V>> {
+  const fn as_vacant(&self) -> Option<&VacantEntry<'map, K, V, S>> {
     match self {
       Entry::Occupied(_) => None,
       Entry::Vacant(entry) => Some(entry),
@@ -111,7 +112,7 @@ impl<'map, K, V> Entry<'map, K, V> {
   }
 }
 
-impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
+impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
   pub fn or_insert<'this>(&'this mut self, value: V) -> &'this V {
     let (map, key) = match self {
       Entry::Occupied(entry) => return entry.get_value(),
@@ -123,6 +124,7 @@ impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
     };
     self.value_unchecked()
   }
+
   pub fn remove(mut self) -> bool {
     match &mut self {
       Entry::Vacant(entry) => {
@@ -156,11 +158,42 @@ impl<'map, K: Hash + PartialEq, V> Entry<'map, K, V> {
 pub type InsertionResult<T> = Result<T, T>;
 
 #[derive(Debug)]
-pub struct ConMap<K, V> {
+pub struct ConMap<K, V, S = RandomState> {
   data: RwLock<Container<K, V>>,
+  build_hasher: S,
 }
 
-impl<K: Hash + PartialEq, V> ConMap<K, V> {
+impl<K, V> Default for ConMap<K, V, RandomState> {
+  fn default() -> Self {
+    Self {
+      data: Default::default(),
+      build_hasher: Default::default(),
+    }
+  }
+}
+
+impl<K, V> ConMap<K, V, RandomState> {
+  pub fn new() -> Self {
+    Default::default()
+  }
+
+  pub fn with_capacity(cap: usize) -> Self {
+    let mut data = Vec::with_capacity(cap);
+    for _ in 0..data.capacity() {
+      data.push((
+        UnsafeCell::new(None),
+        UnsafeCell::new(None),
+        AtomicUsize::new(0),
+      ));
+    }
+    Self {
+      data: RwLock::new(data),
+      build_hasher: Default::default(),
+    }
+  }
+}
+
+impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
   fn realloc(&self) {
     let mut data = self.data.write().unwrap();
     let mut new_cap = data.capacity() << 4;
@@ -202,27 +235,11 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     }
   }
 
-  pub fn new() -> Self {
-    Self {
-      data: RwLock::new(Vec::new()),
-    }
-  }
-
-  pub fn with_capacity(cap: usize) -> Self {
-    let mut data = Vec::with_capacity(cap);
-    for _ in 0..cap {
-      data.push((
-        UnsafeCell::new(None),
-        UnsafeCell::new(None),
-        AtomicUsize::new(0),
-      ));
-    }
-    Self {
-      data: RwLock::new(data),
-    }
-  }
-
-  pub fn insert<'map>(&'map self, mut key: K, mut value: V) -> InsertionResult<Entry<'map, K, V>> {
+  pub fn insert<'map>(
+    &'map self,
+    mut key: K,
+    mut value: V,
+  ) -> InsertionResult<Entry<'map, K, V, S>> {
     loop {
       match self.insert_unchecked(key, value) {
         Ok(ins_res) => return ins_res,
@@ -234,11 +251,17 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     }
   }
 
-  pub fn entry(&self, key: K) -> Entry<K, V> {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
+  pub fn entry(&self, key: K) -> Entry<K, V, S> {
     let data = self.data.read().unwrap();
     let cap = data.capacity();
+    if cap == 0 {
+      return Entry::Vacant(VacantEntry {
+        key: Some(key),
+        map: self,
+      });
+    }
+    let mut hasher = self.build_hasher.build_hasher();
+    key.hash(&mut hasher);
 
     let mut hash = hasher.finish() as usize % cap;
     'outer: for _ in 0..cap {
@@ -303,7 +326,7 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     if cap == 0 {
       return Err((key, value));
     }
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = self.build_hasher.build_hasher();
     key.hash(&mut hasher);
     let mut hash = hasher.finish() as usize % cap;
 
@@ -359,7 +382,7 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
     &'map self,
     key: K,
     value: V,
-  ) -> Result<InsertionResult<Entry<'map, K, V>>, (K, V)> {
+  ) -> Result<InsertionResult<Entry<'map, K, V, S>>, (K, V)> {
     let data = self.data.read().unwrap();
     let acquire_access = |idx| {
       Entry::Occupied(OccupiedEntry {
@@ -373,27 +396,51 @@ impl<K: Hash + PartialEq, V> ConMap<K, V> {
   }
 }
 
-unsafe impl<K: Send, V: Send> Send for ConMap<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for ConMap<K, V> {}
+unsafe impl<K: Send, V: Send, S: Send> Send for ConMap<K, V, S> {}
+unsafe impl<K: Sync, V: Sync, S: Sync> Sync for ConMap<K, V, S> {}
 
-impl<K, V> ConMap<K, V> {
-  pub fn iter<'map>(&'map self) -> Iter<'map, K, V> {
+impl<K, V, S> ConMap<K, V, S> {
+  pub fn iter<'map>(&'map self) -> Iter<'map, K, V, S> {
     Iter {
       idx: 0,
       data: self.data.read().unwrap(),
       rwlock: &self.data,
+      _phantom: Default::default(),
+    }
+  }
+
+  pub fn with_hasher(build_hasher: S) -> Self {
+    Self {
+      data: Default::default(),
+      build_hasher,
+    }
+  }
+
+  pub fn with_capacity_and_hasher(cap: usize, build_hasher: S) -> Self {
+    let mut data = Vec::with_capacity(cap);
+    for _ in 0..data.capacity() {
+      data.push((
+        UnsafeCell::new(None),
+        UnsafeCell::new(None),
+        AtomicUsize::new(0),
+      ))
+    }
+    Self {
+      data: RwLock::new(data),
+      build_hasher,
     }
   }
 }
 
-pub struct Iter<'map, K, V> {
+pub struct Iter<'map, K, V, S> {
   idx: usize,
   data: RwLockReadGuard<'map, Container<K, V>>,
   rwlock: &'map RwLock<Container<K, V>>,
+  _phantom: PhantomData<S>,
 }
 
-impl<'map, K: Hash + PartialEq<K>, V> Iterator for Iter<'map, K, V> {
-  type Item = Entry<'map, K, V>;
+impl<'map, K: Hash + PartialEq<K> + 'map, V: 'map, S: 'map> Iterator for Iter<'map, K, V, S> {
+  type Item = Entry<'map, K, V, S>;
 
   fn next(&mut self) -> Option<Self::Item> {
     'outer: for i in self.idx..self.data.capacity() {
@@ -500,5 +547,15 @@ mod tests {
     map.insert("abcd", 1).unwrap();
     map.insert("abcde", 1).unwrap();
     assert_eq!(*map.entry("abc").or_insert(2), 1);
+    // let map = std::collections::HashMap::new();
+  }
+
+  #[test]
+  fn with_hasher() {
+    let build_hasher = RandomState::new();
+    let map = ConMap::with_hasher(build_hasher);
+    assert_eq!(*map.entry("abc").or_insert(1), 1);
+    assert_eq!(*map.entry("def").or_insert(2), 2);
+    assert_eq!(*map.entry("abc").or_insert(3), 1);
   }
 }
