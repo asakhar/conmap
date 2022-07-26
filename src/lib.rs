@@ -1,12 +1,13 @@
 use std::{
   cell::UnsafeCell,
   collections::hash_map::RandomState,
-  fmt::Debug,
+  error::Error,
+  fmt::{Debug, Display},
   hash::{BuildHasher, Hash, Hasher},
   marker::PhantomData,
   sync::{
     atomic::{AtomicUsize, Ordering},
-    RwLock, RwLockReadGuard,
+    RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
   },
 };
 
@@ -120,7 +121,8 @@ impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
     };
     *self = match map.insert(key, value) {
       Ok(r) => r,
-      Err(r) => r,
+      Err(InsertionError::AlreadyExists(r)) => r,
+      _ => unreachable!(),
     };
     self.value_unchecked()
   }
@@ -155,7 +157,7 @@ impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
   }
 }
 
-pub type InsertionResult<T> = Result<T, T>;
+pub type InsertionResult<T, E> = Result<T, InsertionError<E>>;
 
 #[derive(Debug)]
 pub struct ConMap<K, V, S = RandomState> {
@@ -171,6 +173,38 @@ impl<K, V> Default for ConMap<K, V, RandomState> {
     }
   }
 }
+
+#[derive(Debug)]
+enum TryReallocError {
+  WouldBlock,
+}
+
+impl Display for TryReallocError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("WouldBlock")
+  }
+}
+
+impl Error for TryReallocError {}
+
+type TryReallocResult = Result<(), TryReallocError>;
+
+#[derive(Debug)]
+pub enum InsertionError<E> {
+  AlreadyExists(E),
+  WouldBlock,
+}
+
+impl<E> Display for InsertionError<E> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(match self {
+      InsertionError::AlreadyExists(_) => "AlreadyExists",
+      InsertionError::WouldBlock => "WouldBlock",
+    })
+  }
+}
+
+impl<E: Debug> Error for InsertionError<E> {}
 
 impl<K, V> ConMap<K, V, RandomState> {
   pub fn new() -> Self {
@@ -194,8 +228,7 @@ impl<K, V> ConMap<K, V, RandomState> {
 }
 
 impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
-  fn realloc(&self) {
-    let mut data = self.data.write().unwrap();
+  fn realloc_internal(&self, mut data: RwLockWriteGuard<Container<K, V>>) {
     let mut new_cap = data.capacity() << 4;
     if new_cap == 0 {
       new_cap = 50;
@@ -235,11 +268,27 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
     }
   }
 
+  fn try_realloc(&self) -> TryReallocResult {
+    let res = self.data.try_write();
+    let data = match res {
+      Ok(data) => data,
+      Err(TryLockError::WouldBlock) => return Err(TryReallocError::WouldBlock),
+      Err(TryLockError::Poisoned(_)) => res.unwrap(),
+    };
+    self.realloc_internal(data);
+    Ok(())
+  }
+
+  fn realloc(&self) {
+    let data = self.data.write().unwrap();
+    self.realloc_internal(data);
+  }
+
   pub fn insert<'map>(
     &'map self,
     mut key: K,
     mut value: V,
-  ) -> InsertionResult<Entry<'map, K, V, S>> {
+  ) -> InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>> {
     loop {
       match self.insert_unchecked(key, value) {
         Ok(ins_res) => return ins_res,
@@ -248,6 +297,25 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
         }
       }
       self.realloc();
+    }
+  }
+
+  pub fn try_insert<'map>(
+    &'map self,
+    mut key: K,
+    mut value: V,
+  ) -> InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>> {
+    loop {
+      match self.try_insert_unchecked(key, value) {
+        Ok(ins_res) => return ins_res,
+        Err(kv) => {
+          (key, value) = kv;
+        }
+      }
+      match self.try_realloc() {
+        Ok(()) => {}
+        Err(TryReallocError::WouldBlock) => return Err(InsertionError::WouldBlock),
+      }
     }
   }
 
@@ -311,9 +379,12 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
       let cell: &ContainerItem<K, V> = unsafe { data.get_unchecked(idx) };
       cell.2.fetch_sub(1, Ordering::Relaxed);
     };
-    let _ = self
-      .insert_unchecked_internal(data, key, value)
-      .map(|res| res.map(release).map_err(release));
+    let _ = self.insert_unchecked_internal(data, key, value).map(|res| {
+      res.map(release).map_err(|err| match err {
+        InsertionError::AlreadyExists(idx) => InsertionError::AlreadyExists(release(idx)),
+        InsertionError::WouldBlock => InsertionError::WouldBlock,
+      })
+    });
   }
 
   fn insert_unchecked_internal(
@@ -321,7 +392,7 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
     data: &Container<K, V>,
     key: K,
     value: V,
-  ) -> Result<InsertionResult<usize>, (K, V)> {
+  ) -> Result<InsertionResult<usize, usize>, (K, V)> {
     let cap = data.capacity();
     if cap == 0 {
       return Err((key, value));
@@ -371,18 +442,43 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
           cell.2.fetch_sub(1, Ordering::Relaxed);
           break;
         }
-        return Ok(Err(hash));
+        return Ok(Err(InsertionError::AlreadyExists(hash)));
       }
       hash = (hash + HASH_STEP) % cap;
     }
     return Err((key, value));
   }
 
+  fn try_insert_unchecked<'map>(
+    &'map self,
+    key: K,
+    value: V,
+  ) -> Result<InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>>, (K, V)> {
+    let res = self.data.try_read();
+    let data = match res {
+      Ok(data) => data,
+      Err(TryLockError::WouldBlock) => return Ok(Err(InsertionError::WouldBlock)),
+      _ => unreachable!(),
+    };
+    let acquire_access = |idx| {
+      Entry::Occupied(OccupiedEntry {
+        idx,
+        data: self.data.read().unwrap(),
+      })
+    };
+    self.insert_unchecked_internal(&data, key, value).map(|v| {
+      v.map(acquire_access).map_err(|err| match err {
+        InsertionError::AlreadyExists(idx) => InsertionError::AlreadyExists(acquire_access(idx)),
+        InsertionError::WouldBlock => InsertionError::WouldBlock,
+      })
+    })
+  }
+
   fn insert_unchecked<'map>(
     &'map self,
     key: K,
     value: V,
-  ) -> Result<InsertionResult<Entry<'map, K, V, S>>, (K, V)> {
+  ) -> Result<InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>>, (K, V)> {
     let data = self.data.read().unwrap();
     let acquire_access = |idx| {
       Entry::Occupied(OccupiedEntry {
@@ -390,9 +486,12 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
         data: self.data.read().unwrap(),
       })
     };
-    self
-      .insert_unchecked_internal(&data, key, value)
-      .map(|v| v.map(acquire_access).map_err(acquire_access))
+    self.insert_unchecked_internal(&data, key, value).map(|v| {
+      v.map(acquire_access).map_err(|err| match err {
+        InsertionError::AlreadyExists(idx) => InsertionError::AlreadyExists(acquire_access(idx)),
+        InsertionError::WouldBlock => InsertionError::WouldBlock,
+      })
+    })
   }
 }
 
