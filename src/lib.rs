@@ -1,59 +1,87 @@
-use std::{
-  cell::UnsafeCell,
-  collections::hash_map::RandomState,
-  error::Error,
+use core::{
   fmt::{Debug, Display},
   hash::{BuildHasher, Hash, Hasher},
   marker::PhantomData,
-  sync::{
-    atomic::{AtomicUsize, Ordering},
-    RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
-  },
 };
+
+#[allow(unused_imports)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::{collections::hash_map::RandomState, error::Error};
+
+use rwspin::{RwSpin, RwSpinReadGuard, RwSpinWriteGuard};
+
+pub mod rwspin;
 
 const HASH_STEP: usize = 1337;
 
-#[allow(non_snake_case)]
-mod CellState {
-  #[allow(non_upper_case_globals)]
-  pub const Empty: usize = 0;
-  #[allow(non_upper_case_globals)]
-  pub const Removed: usize = 1;
-  #[allow(non_upper_case_globals)]
-  pub const Uninit: usize = 2;
+#[derive(Debug, PartialEq, Eq)]
+enum State<K, V> {
+  Vacant,
+  Occupied((K, V)),
+  Removed,
+}
 
-  #[macro_export(local_inner_macros)]
-  macro_rules! Valid {
-    ($n:expr) => {
-      (CellState::Uninit + 1 + $n)
-    };
+impl<K, V> Default for State<K, V> {
+  fn default() -> Self {
+    State::Vacant
   }
 }
 
-type ContainerItem<K, V> = (UnsafeCell<Option<K>>, UnsafeCell<Option<V>>, AtomicUsize);
+impl<K, V> State<K, V> {
+  const fn as_occupied(&self) -> Option<&(K, V)> {
+    use State::Occupied;
+    match self {
+      Occupied(ref kv) => Some(kv),
+      _ => None,
+    }
+  }
+  const fn as_occupied_unchecked(&self) -> &(K, V) {
+    use State::Occupied;
+    match self {
+      Occupied(ref kv) => kv,
+      _ => panic!("State was unoccupied"),
+    }
+  }
+  fn take(&mut self) -> Self {
+    core::mem::replace(self, State::Vacant)
+  }
+  const fn is_occupied(&self) -> bool {
+    self.as_occupied().is_some()
+  }
+  fn to_occupied_unchecked(self) -> (K, V) {
+    use State::Occupied;
+    match self {
+      Occupied(kv) => kv,
+      _ => panic!("Assumed occupiedd state"),
+    }
+  }
+}
+
+type ContainerItem<K, V> = RwSpin<State<K, V>>;
 type Container<K, V> = Vec<ContainerItem<K, V>>;
 
 #[derive(Debug)]
 pub struct OccupiedEntry<'map, K, V> {
-  idx: usize,
-  data: RwLockReadGuard<'map, Container<K, V>>,
+  rl: Option<RwSpinReadGuard<'map, State<K, V>>>,
+  data: RwSpinReadGuard<'map, Container<K, V>>,
 }
 
 impl<'map, K, V> OccupiedEntry<'map, K, V> {
-  fn get(&self) -> &ContainerItem<K, V> {
-    unsafe { self.data.get_unchecked(self.idx) }
-  }
-  fn get_value(&self) -> &V {
-    unsafe { &*self.get().1.get() }.as_ref().unwrap()
-  }
-  fn get_key(&self) -> &K {
-    unsafe { &*self.get().0.get() }.as_ref().unwrap()
+  fn new(data: RwSpinReadGuard<'map, Container<K, V>>, idx: usize) -> Self {
+    let mut res = Self { data, rl: None };
+    res.rl = Some(
+      unsafe {
+        (*(&mut res.data as *mut RwSpinReadGuard<'map, Container<K, V>>)).get_unchecked(idx)
+      }
+      .read(),
+    );
+    res
   }
 }
 
 #[derive(Debug)]
 pub struct VacantEntry<'map, K, V, S> {
-  key: Option<K>,
+  key: K,
   map: &'map ConMap<K, V, S>,
 }
 
@@ -61,64 +89,80 @@ pub struct VacantEntry<'map, K, V, S> {
 pub enum Entry<'map, K, V, S> {
   Vacant(VacantEntry<'map, K, V, S>),
   Occupied(OccupiedEntry<'map, K, V>),
+  Uninit,
 }
 
-impl<'map, K, V, S> Drop for Entry<'map, K, V, S> {
-  fn drop(&mut self) {
-    if let Entry::Occupied(entry) = self {
-      unsafe { entry.data.get_unchecked(entry.idx) }
-        .2
-        .fetch_sub(1, Ordering::Relaxed);
-    }
-  }
-}
 impl<'map, K, V, S> Entry<'map, K, V, S> {
   const fn as_occupied_unchecked(&self) -> &OccupiedEntry<'map, K, V> {
     match self {
-      Entry::Vacant(_) => panic!("Called as_occupied on vacant entry"),
       Entry::Occupied(entry) => entry,
+      _ => panic!("Called as_occupied on vacant entry"),
     }
   }
   #[allow(dead_code)]
   const fn as_vacant_unchecked(&self) -> &VacantEntry<'map, K, V, S> {
     match self {
-      Entry::Occupied(_) => panic!("Called as_vacant on occupied entry"),
       Entry::Vacant(entry) => entry,
+      _ => panic!("Called as_vacant on occupied entry"),
+    }
+  }
+
+  #[allow(dead_code)]
+  fn to_vacant_unchecked(self) -> VacantEntry<'map, K, V, S> {
+    match self {
+      Entry::Vacant(entry) => entry,
+      _ => panic!("Called as_vacant on occupied entry"),
     }
   }
   const fn as_occupied(&self) -> Option<&OccupiedEntry<'map, K, V>> {
     match self {
-      Entry::Vacant(_) => None,
       Entry::Occupied(entry) => Some(entry),
+      _ => None,
     }
   }
   #[allow(dead_code)]
   const fn as_vacant(&self) -> Option<&VacantEntry<'map, K, V, S>> {
     match self {
-      Entry::Occupied(_) => None,
       Entry::Vacant(entry) => Some(entry),
+      _ => None,
     }
   }
   pub fn value_unchecked(&self) -> &V {
-    self.as_occupied_unchecked().get_value()
+    &self
+      .as_occupied_unchecked()
+      .rl
+      .as_ref()
+      .unwrap()
+      .as_occupied_unchecked()
+      .1
   }
   pub fn value(&self) -> Option<&V> {
-    Some(self.as_occupied()?.get_value())
+    Some(&self.as_occupied()?.rl.as_ref().unwrap().as_occupied()?.1)
   }
   pub fn key(&self) -> &K {
     match self {
-      Entry::Vacant(entry) => entry.key.as_ref().unwrap(),
-      Entry::Occupied(entry) => entry.get_key(),
+      Entry::Vacant(ref entry) => &entry.key,
+      Entry::Occupied(entry) => &entry.rl.as_ref().unwrap().as_occupied_unchecked().0,
+      Entry::Uninit => unreachable!(),
     }
   }
 }
 
+#[derive(Debug)]
+pub enum TryRemoveError {
+  WouldBlock,
+  DoesNotExist,
+}
+
+pub type TryRemoveResult<K, V> = Result<(K, V), TryRemoveError>;
+
 impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
   pub fn or_insert<'this>(&'this mut self, value: V) -> &'this V {
-    let (map, key) = match self {
-      Entry::Occupied(entry) => return entry.get_value(),
-      Entry::Vacant(entry) => (entry.map, entry.key.take().unwrap()),
-    };
+    if self.as_occupied().is_some() {
+      return self.value_unchecked();
+    }
+    let entry = core::mem::replace(self, Entry::Uninit);
+    let VacantEntry { map, key } = entry.to_vacant_unchecked();
     *self = match map.insert(key, value) {
       Ok(r) => r,
       Err(InsertionError::AlreadyExists(r)) => r,
@@ -127,41 +171,47 @@ impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
     self.value_unchecked()
   }
 
-  pub fn remove(mut self) -> bool {
-    match &mut self {
+  pub fn remove(self) -> Option<(K, V)> {
+    match self {
       Entry::Vacant(entry) => {
-        let entry = entry.map.entry(entry.key.take().unwrap());
+        let entry = entry.map.entry(entry.key);
         if entry.as_occupied().is_none() {
-          return false;
+          return None;
         }
         entry.remove()
       }
       Entry::Occupied(entry) => {
-        let cell = entry.get();
-        while cell
-          .2
-          .compare_exchange_weak(
-            Valid!(1),
-            CellState::Uninit,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-          )
-          .is_err()
-        {}
-        unsafe { &mut *cell.0.get() }.take();
-        unsafe { &mut *cell.1.get() }.take();
-        cell.2.store(CellState::Removed, Ordering::SeqCst);
-        true
+        let old = core::mem::replace(&mut *entry.rl.unwrap().into_write(), State::Removed);
+        match old {
+          State::Occupied(kv) => Some(kv),
+          _ => None,
+        }
       }
+      Entry::Uninit => unreachable!(),
+    }
+  }
+
+  pub fn try_remove(self) -> TryRemoveResult<K, V> {
+    match self {
+      Entry::Vacant(entry) => {
+        let entry = entry.map.entry(entry.key);
+        if entry.as_occupied().is_none() {
+          return Err(TryRemoveError::DoesNotExist);
+        }
+        entry.try_remove()
+      }
+      Entry::Occupied(entry) => match entry.rl.unwrap().try_into_write() {
+        Ok(mut res) => Ok(core::mem::replace(&mut *res, State::Removed).to_occupied_unchecked()),
+        Err(_) => Err(TryRemoveError::WouldBlock),
+      },
+      Entry::Uninit => unreachable!(),
     }
   }
 }
 
-pub type InsertionResult<T, E> = Result<T, InsertionError<E>>;
-
 #[derive(Debug)]
 pub struct ConMap<K, V, S = RandomState> {
-  data: RwLock<Container<K, V>>,
+  data: RwSpin<Container<K, V>>,
   build_hasher: S,
 }
 
@@ -173,21 +223,6 @@ impl<K, V> Default for ConMap<K, V, RandomState> {
     }
   }
 }
-
-#[derive(Debug)]
-enum TryReallocError {
-  WouldBlock,
-}
-
-impl Display for TryReallocError {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str("WouldBlock")
-  }
-}
-
-impl Error for TryReallocError {}
-
-type TryReallocResult = Result<(), TryReallocError>;
 
 #[derive(Debug)]
 pub enum InsertionError<E> {
@@ -214,74 +249,46 @@ impl<K, V> ConMap<K, V, RandomState> {
   pub fn with_capacity(cap: usize) -> Self {
     let mut data = Vec::with_capacity(cap);
     for _ in 0..data.capacity() {
-      data.push((
-        UnsafeCell::new(None),
-        UnsafeCell::new(None),
-        AtomicUsize::new(0),
-      ));
+      data.push(RwSpin::new(State::Vacant));
     }
     Self {
-      data: RwLock::new(data),
+      data: RwSpin::new(data),
       build_hasher: Default::default(),
     }
   }
 }
 
+pub type InsertionResult<T, E> = Result<T, InsertionError<E>>;
+
 impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
-  fn realloc_internal(&self, mut data: RwLockWriteGuard<Container<K, V>>) {
+  fn realloc_internal(&self, mut data: RwSpinWriteGuard<Container<K, V>>) {
     let mut new_cap = data.capacity() << 4;
     if new_cap == 0 {
       new_cap = 50;
     }
     let old_data = data
-      .iter_mut()
-      .map(|(key, value, state)| {
-        let state_load = state.load(Ordering::Relaxed);
-        if state_load <= CellState::Uninit {
-          key.get_mut().take();
-          value.get_mut().take();
-        }
-        state.store(CellState::Empty, Ordering::Relaxed);
-        (key, value, state_load > CellState::Uninit)
-      })
-      .filter(|(_, _, should_take)| *should_take)
-      .map(|(key, value, _)| {
-        (
-          key.get_mut().take().unwrap(),
-          value.get_mut().take().unwrap(),
-        )
-      })
+      .iter()
+      .map(|spin| spin.write().take())
+      .filter(|item| item.is_occupied())
+      .map(|item| item.to_occupied_unchecked())
       .collect::<Vec<_>>();
     let old_len = data.len();
     data.reserve(new_cap - old_len);
     let new_cap = data.capacity();
     let remaining = new_cap - old_len;
-    for _ in 0..remaining {
-      data.push((
-        UnsafeCell::new(None),
-        UnsafeCell::new(None),
-        AtomicUsize::new(0),
-      ));
-    }
+    data.resize_with(remaining, Default::default);
     for (key, value) in old_data {
       self.insert_unchecked_no_ret(&data, key, value);
     }
   }
 
-  fn try_realloc(&self) -> TryReallocResult {
-    let res = self.data.try_write();
-    let data = match res {
-      Ok(data) => data,
-      Err(TryLockError::WouldBlock) => return Err(TryReallocError::WouldBlock),
-      Err(TryLockError::Poisoned(_)) => res.unwrap(),
-    };
-    self.realloc_internal(data);
-    Ok(())
+  fn try_realloc(&self) -> Option<()> {
+    self.realloc_internal(self.data.try_write()?);
+    Some(())
   }
 
   fn realloc(&self) {
-    let data = self.data.write().unwrap();
-    self.realloc_internal(data);
+    self.realloc_internal(self.data.write());
   }
 
   pub fn insert<'map>(
@@ -312,87 +319,53 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
           (key, value) = kv;
         }
       }
-      match self.try_realloc() {
-        Ok(()) => {}
-        Err(TryReallocError::WouldBlock) => return Err(InsertionError::WouldBlock),
+      if self.try_realloc().is_none() {
+        return Err(InsertionError::WouldBlock);
       }
     }
   }
 
-  pub fn entry(&self, key: K) -> Entry<K, V, S> {
-    let data = self.data.read().unwrap();
+  pub fn entry<'map>(&'map self, key: K) -> Entry<'map, K, V, S> {
+    use State::*;
+    let data = self.data.read();
     let cap = data.capacity();
     if cap == 0 {
-      return Entry::Vacant(VacantEntry {
-        key: Some(key),
-        map: self,
-      });
+      return Entry::Vacant(VacantEntry { key, map: self });
     }
     let mut hasher = self.build_hasher.build_hasher();
     key.hash(&mut hasher);
 
     let mut hash = hasher.finish() as usize % cap;
-    'outer: for _ in 0..cap {
+    for _ in 0..cap {
       // SAFETY: hash is always in bounds of data
       let cell = unsafe { data.get_unchecked(hash) };
 
-      loop {
-        let current_state = cell.2.load(Ordering::SeqCst);
-        if current_state == CellState::Empty {
-          break 'outer;
+      let cell_read = cell.read();
+      match &*cell_read {
+        Occupied((k, _)) if k == &key => {
+          return Entry::Occupied(OccupiedEntry::new(data.clone(), hash))
         }
-        if current_state == CellState::Removed {
-          break;
-        }
-        if current_state == usize::MAX || current_state == CellState::Uninit {
-          continue;
-        }
-        if cell
-          .2
-          .compare_exchange(
-            current_state,
-            current_state + 1,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-          )
-          .is_err()
-        {
-          continue;
-        }
-        let key_ref = unsafe { &*cell.0.get() }.as_ref().unwrap();
-        if key_ref != &key {
-          cell.2.fetch_sub(1, Ordering::SeqCst);
-          break;
-        }
-        return Entry::Occupied(OccupiedEntry { idx: hash, data });
-      }
+        Vacant => break,
+        Removed | Occupied(_) => {}
+      };
       hash = (hash + HASH_STEP) % cap;
     }
-    return Entry::Vacant(VacantEntry {
-      key: Some(key),
-      map: self,
-    });
+    return Entry::Vacant(VacantEntry { key, map: self });
   }
 
   fn insert_unchecked_no_ret(&self, data: &Container<K, V>, key: K, value: V) {
-    let release = |idx| {
-      let cell: &ContainerItem<K, V> = unsafe { data.get_unchecked(idx) };
-      cell.2.fetch_sub(1, Ordering::Relaxed);
-    };
-    let _ = self.insert_unchecked_internal(data, key, value).map(|res| {
-      res.map(release).map_err(|err| match err {
-        InsertionError::AlreadyExists(idx) => InsertionError::AlreadyExists(release(idx)),
-        InsertionError::WouldBlock => InsertionError::WouldBlock,
-      })
-    });
+    let _ = self.insert_unchecked_internal(data, key, value);
   }
 
-  fn insert_unchecked_internal(
-    &self,
-    data: &Container<K, V>,
+  fn insert_unchecked_internal<'map>(
+    &'map self,
+    data: &'map Container<K, V>,
     key: K,
     value: V,
-  ) -> Result<InsertionResult<usize, usize>, (K, V)> {
+  ) -> Result<
+    InsertionResult<(usize, RwSpinReadGuard<State<K, V>>), (usize, RwSpinReadGuard<State<K, V>>)>,
+    (K, V),
+  > {
     let cap = data.capacity();
     if cap == 0 {
       return Err((key, value));
@@ -404,45 +377,16 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
     for _ in 0..cap {
       // SAFETY: hash is always in bounds of data
       let cell = unsafe { data.get_unchecked(hash) };
-      loop {
-        let state = cell.2.load(Ordering::SeqCst);
-
-        if state < CellState::Uninit {
-          if cell
-            .2
-            .compare_exchange(
-              state,
-              CellState::Uninit,
-              Ordering::SeqCst,
-              Ordering::Relaxed,
-            )
-            .is_ok()
-          {
-            unsafe { *cell.0.get() = Some(key) };
-            unsafe { *cell.1.get() = Some(value) };
-
-            cell.2.store(Valid!(1), Ordering::SeqCst);
-            return Ok(Ok(hash));
-          }
-          continue;
-        }
-
-        if state == usize::MAX || state == CellState::Uninit {
-          continue;
-        }
-        if cell
-          .2
-          .compare_exchange(state, state + 1, Ordering::SeqCst, Ordering::Relaxed)
-          .is_err()
-        {
-          continue;
-        }
-        let cell_key = unsafe { &*cell.0.get() }.as_ref().unwrap();
-        if cell_key != &key {
-          cell.2.fetch_sub(1, Ordering::Relaxed);
-          break;
-        }
-        return Ok(Err(InsertionError::AlreadyExists(hash)));
+      let cell_read = cell.read();
+      if !cell_read.is_occupied() {
+        let mut cell_write = cell_read.into_write();
+        let _old = core::mem::replace(&mut *cell_write, State::Occupied((key, value)));
+        // debug_assert!(_old == Vacant || _old == Removed);
+        return Ok(Ok((hash, cell_write.into())));
+      }
+      let (k, _) = &*cell_read.as_occupied_unchecked();
+      if k == &key {
+        return Ok(Err(InsertionError::AlreadyExists((hash, cell_read))));
       }
       hash = (hash + HASH_STEP) % cap;
     }
@@ -454,18 +398,18 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
     key: K,
     value: V,
   ) -> Result<InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>>, (K, V)> {
-    let res = self.data.try_read();
-    let data = match res {
-      Ok(data) => data,
-      Err(TryLockError::WouldBlock) => return Ok(Err(InsertionError::WouldBlock)),
-      _ => unreachable!(),
+    let data = self.data.try_read();
+    if data.is_none() {
+      return Ok(Err(InsertionError::WouldBlock));
+    }
+    let data = data.unwrap();
+
+    let acquire_access = |(idx, rl)| {
+      let res = Entry::Occupied(OccupiedEntry::new(data.clone(), idx));
+      drop(rl);
+      res
     };
-    let acquire_access = |idx| {
-      Entry::Occupied(OccupiedEntry {
-        idx,
-        data: self.data.read().unwrap(),
-      })
-    };
+
     self.insert_unchecked_internal(&data, key, value).map(|v| {
       v.map(acquire_access).map_err(|err| match err {
         InsertionError::AlreadyExists(idx) => InsertionError::AlreadyExists(acquire_access(idx)),
@@ -479,12 +423,11 @@ impl<K: Hash + PartialEq, V, S: BuildHasher> ConMap<K, V, S> {
     key: K,
     value: V,
   ) -> Result<InsertionResult<Entry<'map, K, V, S>, Entry<'map, K, V, S>>, (K, V)> {
-    let data = self.data.read().unwrap();
-    let acquire_access = |idx| {
-      Entry::Occupied(OccupiedEntry {
-        idx,
-        data: self.data.read().unwrap(),
-      })
+    let data = self.data.read();
+    let acquire_access = |(idx, rl)| {
+      let res = Entry::Occupied(OccupiedEntry::new(data.clone(), idx));
+      drop(rl);
+      res
     };
     self.insert_unchecked_internal(&data, key, value).map(|v| {
       v.map(acquire_access).map_err(|err| match err {
@@ -502,8 +445,7 @@ impl<K, V, S> ConMap<K, V, S> {
   pub fn iter<'map>(&'map self) -> Iter<'map, K, V, S> {
     Iter {
       idx: 0,
-      data: self.data.read().unwrap(),
-      rwlock: &self.data,
+      data: self.data.read(),
       _phantom: Default::default(),
     }
   }
@@ -518,14 +460,10 @@ impl<K, V, S> ConMap<K, V, S> {
   pub fn with_capacity_and_hasher(cap: usize, build_hasher: S) -> Self {
     let mut data = Vec::with_capacity(cap);
     for _ in 0..data.capacity() {
-      data.push((
-        UnsafeCell::new(None),
-        UnsafeCell::new(None),
-        AtomicUsize::new(0),
-      ))
+      data.push(Default::default());
     }
     Self {
-      data: RwLock::new(data),
+      data: RwSpin::new(data),
       build_hasher,
     }
   }
@@ -533,8 +471,7 @@ impl<K, V, S> ConMap<K, V, S> {
 
 pub struct Iter<'map, K, V, S> {
   idx: usize,
-  data: RwLockReadGuard<'map, Container<K, V>>,
-  rwlock: &'map RwLock<Container<K, V>>,
+  data: RwSpinReadGuard<'map, Container<K, V>>,
   _phantom: PhantomData<S>,
 }
 
@@ -542,34 +479,10 @@ impl<'map, K: Hash + PartialEq<K> + 'map, V: 'map, S: 'map> Iterator for Iter<'m
   type Item = Entry<'map, K, V, S>;
 
   fn next(&mut self) -> Option<Self::Item> {
-    'outer: for i in self.idx..self.data.capacity() {
-      let cell = unsafe { self.data.get_unchecked(i) };
-      loop {
-        let current_state = cell.2.load(Ordering::SeqCst);
-        if current_state <= CellState::Removed {
-          continue 'outer;
-        }
-        if current_state == usize::MAX || current_state == CellState::Uninit {
-          continue;
-        }
-        if cell
-          .2
-          .compare_exchange(
-            current_state,
-            current_state + 1,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-          )
-          .is_err()
-        {
-          continue;
-        }
-        debug_assert!(cell.2.load(Ordering::SeqCst) > Valid!(0));
-        self.idx = i + 1;
-        return Some(Entry::Occupied(OccupiedEntry {
-          idx: i,
-          data: self.rwlock.read().unwrap(),
-        }));
+    for i in self.idx..self.data.capacity() {
+      let cell = unsafe { self.data.get_unchecked(i) }.read();
+      if cell.is_occupied() {
+        return Some(Entry::Occupied(OccupiedEntry::new(self.data.clone(), i)));
       }
     }
     None
@@ -633,7 +546,7 @@ mod tests {
     map.insert("a", "a").unwrap();
     let b = map.insert("b", "b").unwrap();
     map.insert("c", "c").unwrap();
-    assert!(b.remove());
+    assert!(b.remove() == Some(("b", "b")));
     assert_eq!(map.entry("a").value(), Some(&"a"));
     assert_eq!(map.entry("c").value(), Some(&"c"));
     assert_eq!(map.entry("b").value(), None);
