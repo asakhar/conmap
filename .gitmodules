@@ -1,3 +1,6 @@
 [submodule "constack"]
 	path = constack
 	url = https://github.com/asakhar/constack.git
+[submodule "rwspin"]
+	path = rwspin
+	url = https://github.com/asakhar/rwspin.git

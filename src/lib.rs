@@ -11,8 +11,6 @@ use std::{collections::hash_map::RandomState, error::Error};
 use constack::ConStack;
 use rwspin::{RwSpin, RwSpinReadGuard, RwSpinWriteGuard};
 
-pub mod rwspin;
-
 const HASH_STEP: usize = 1337;
 
 #[derive(Debug, PartialEq, Eq)]
