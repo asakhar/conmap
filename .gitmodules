@@ -1,0 +1,3 @@
+[submodule "constack"]
+	path = constack
+	url = https://github.com/asakhar/constack.git
