@@ -8,6 +8,7 @@ use core::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::hash_map::RandomState, error::Error};
 
+use constack::ConStack;
 use rwspin::{RwSpin, RwSpinReadGuard, RwSpinWriteGuard};
 
 pub mod rwspin;
@@ -213,6 +214,8 @@ impl<'map, K: Hash + PartialEq, V, S: BuildHasher> Entry<'map, K, V, S> {
 pub struct ConMap<K, V, S = RandomState> {
   data: RwSpin<Container<K, V>>,
   build_hasher: S,
+  help_tasks: ConStack<(usize, usize)>,
+  help_count: AtomicUsize,
 }
 
 impl<K, V> Default for ConMap<K, V, RandomState> {
@@ -220,6 +223,8 @@ impl<K, V> Default for ConMap<K, V, RandomState> {
     Self {
       data: Default::default(),
       build_hasher: Default::default(),
+      help_tasks: Default::default(),
+      help_count: Default::default(),
     }
   }
 }
@@ -254,6 +259,8 @@ impl<K, V> ConMap<K, V, RandomState> {
     Self {
       data: RwSpin::new(data),
       build_hasher: Default::default(),
+      help_tasks: Default::default(),
+      help_count: Default::default(),
     }
   }
 }
@@ -454,6 +461,8 @@ impl<K, V, S> ConMap<K, V, S> {
     Self {
       data: Default::default(),
       build_hasher,
+      help_tasks: Default::default(),
+      help_count: Default::default(),
     }
   }
 
@@ -465,6 +474,8 @@ impl<K, V, S> ConMap<K, V, S> {
     Self {
       data: RwSpin::new(data),
       build_hasher,
+      help_tasks: Default::default(),
+      help_count: Default::default(),
     }
   }
 }
